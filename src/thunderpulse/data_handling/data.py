@@ -1,5 +1,6 @@
 """Data loading helpers for ThunderPulse."""
 
+from IPython import embed
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,7 +94,8 @@ def load_data(
     """Load a single OpenEphys or WAV data recording session from the specified path."""
     data_path = Path(data_path)
     probe_path = Path(probe_path)
-    wav_files = list(Path(data_path).rglob("*.wav"))
+    wav_files = sorted(Path(data_path).rglob("*.wav"))
+    # wav_files = wav_files[5:10]  # For testing purposes, only load a subset
 
     if len(wav_files) > 0:
         log.debug("Data directory has wav files")
@@ -106,8 +108,8 @@ def load_data(
             file_list = [str(file) for file in file_list]
 
         d = AudioLoader(file_list)
-        d.set_unwrap(thresh=1.5)
-        log.debug("Wav dataset unwrapping enabled")
+        # d.set_unwrap(thresh=0.4)
+        # log.debug("Wav dataset unwrapping enabled")
         ids = np.arange(len(seonsory_array["coordinates"]))
         coordinates = np.array(seonsory_array["coordinates"])
         data_c = Data(

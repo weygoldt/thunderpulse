@@ -1,5 +1,6 @@
 """Main loop to parse large datasets and collect pulses."""
 
+import pandas as pd
 import gc
 import logging
 import re
@@ -205,6 +206,9 @@ def detect_peaks_on_block(
         mode=params.peaks.mode,
         find_peaks_kwargs=params.peaks.find_peaks_kwargs,
     )
+    if pulse_list.size == 0:
+        log.info("No peaks detected in this block")
+        return None
 
     if not params.peaks.cutout_window_around_peak_s:
         cutout_window_around_peak = int(
@@ -234,6 +238,7 @@ def detect_peaks_on_block(
     )
     pulse_center = np.zeros_like(pulse_list)
     pulse_array = np.zeros((pulse_list.shape[0], cutout_size))
+    pulse_amplitude = np.zeros_like(pulse_list, dtype=np.float32)
 
     for i, (peak, ch) in enumerate(
         zip(pulse_list, channels_list, strict=True)
@@ -254,10 +259,13 @@ def detect_peaks_on_block(
             cutout_window_around_peak + pulse_center[i],
         ]
 
+        pulse_amplitude[i] = block_filtered[peak, ch]
+
     output_data["pulses"] = pulse_array
     output_data["channels"] = channels_list
     output_data["centers"] = pulse_center
     output_data["start_stop_index"] = start_stop_index
+    output_data["amplitudes"] = pulse_amplitude
 
     # TODO: Vectorize this
     # pulse_array = input_data[:, channels_list][
@@ -313,12 +321,6 @@ def post_process_peaks_per_block(
             sign *= -1
         new_peaks = new_peaks * sign
 
-    if params.postprocessing.enable_normalization:
-        log.debug("Normalizing peak snippets")
-        # Normalize peak snippets
-        norm = np.max(new_peaks, axis=1)
-        new_peaks = new_peaks / norm[:, np.newaxis]
-
     if params.postprocessing.enable_centering:
         log.debug("Re-centering peak snippets")
         if params.postprocessing.centering_method in ["min", "max"]:
@@ -331,6 +333,19 @@ def post_process_peaks_per_block(
         else:
             raise NotImplementedError()
 
+    if params.postprocessing.enable_normalization:
+        log.debug("Normalizing peak snippets")
+        # Normalize peak snippets
+        norm = np.max(new_peaks, axis=1)
+        new_peaks = new_peaks / norm[:, np.newaxis]
+
+    # if len(new_peaks) > 10:
+    #     for p in new_peaks:
+    #         plt.plot(p)
+    #     plt.show()
+    #     # embed()
+    #     # exit()
+
     if np.any(np.isnan(new_peaks)):
         msg = "NaN values in peak snippets"
         embed()
@@ -342,6 +357,7 @@ def post_process_peaks_per_block(
 
 def process_dataset(
     data: Data,
+    calib_path: Path,
     params: Params,
     output_path: Path,
 ) -> int:
@@ -352,17 +368,29 @@ def process_dataset(
     blocksize = int(np.ceil(rate * params.buffersize_s))
     overlap = blocksize // 10
 
+    print(f"Processing data with samplerate: {rate} Hz")
+
     # Open NIX file
     nix_file = nixio.File.open(str(output_path), nixio.FileMode.Overwrite)
     nix_block = nix_file.create_block(
         name="pulses.nix", type_="ThunderPulse.pulses"
     )
 
+    # Open calibration data
+    calib_data = pd.read_csv(calib_path, index_col=False)
+    calib_fact = calib_data["rel_scaling_fact"].values
+
     n_pulses = 0
     num_blocks = int(np.ceil(data.metadata.frames / (blocksize - overlap)))
+    print(params.buffersize_s)
+    print(
+        f"Processing {num_blocks} blocks of size {blocksize} with overlap {overlap}"
+    )
+
     # with get_progress() as pbar:
     #     desc = "Processing file"
     #     task = pbar.add_task(desc, total=num_blocks, transient=True)
+    dataarrays_created = False
     for blockiterval, block in enumerate(
         data.blocks(blocksize=blocksize, overlap=overlap)
     ):
@@ -371,6 +399,8 @@ def process_dataset(
             "blocksize": blocksize,
             "overlap": overlap,
         }
+
+        block = block * calib_fact
 
         block_peaks = detect_peaks_on_block(
             block,
@@ -387,16 +417,20 @@ def process_dataset(
             block_peaks, params, blockinfo
         )
         n_pulses += block_peaks["pulses"].shape[0]
-        if blockiterval == 0:
+        if not dataarrays_created:
             # Initialize dataset
             for key, value in block_peaks.items():
                 try:
                     data_array = nix_block.create_data_array(
                         key, f"thunderpulse.{key}", data=value
                     )
+                    print(
+                        f"Created data array for {key} with shape {value.shape}"
+                    )
                 except ValueError:
                     embed()
                     exit()
+            dataarrays_created = True
 
         else:
             for key, value in block_peaks.items():
@@ -474,7 +508,18 @@ def main(
     params = Params().from_json(str(config_path))
     subdirs = sorted(datapath.glob("*/"))
 
-    for recording_path in subdirs:
+    calib_paths = [
+        Path(
+            "/home/weygoldt/wrk/analyses/eelgrid/grid1_calib3_calibration.csv"
+        ),
+        Path(
+            "/home/weygoldt/wrk/analyses/eelgrid/grid2_calib3_calibration.csv"
+        ),
+    ]
+
+    for i, recording_path in enumerate(subdirs):
+        calib_file = calib_paths[i]
+        print(f"Using calibration file: {calib_file} for {recording_path}")
         outfile_dir = savepath / recording_path.name
         outfile_dir.mkdir(parents=True, exist_ok=True)
         outfile_path = outfile_dir / "pulses.h5"
@@ -490,6 +535,7 @@ def main(
         log.info(f"Processing file: {recording_path}")
         n_pulses = process_dataset(
             data,
+            calib_path=calib_file,
             params=params,
             output_path=outfile_path,
         )
